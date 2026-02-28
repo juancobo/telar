@@ -27,7 +27,7 @@ skip_collections) from _config.yml, which allow developers to
 temporarily suppress certain collections during development.
 Legacy names (hide_stories, hide_collections) are also supported.
 
-Version: v0.8.1-beta
+Version: v0.8.2-beta
 """
 
 import json
@@ -45,6 +45,25 @@ from telar.images import process_images
 from telar.glossary import process_glossary_links, load_glossary_terms
 from telar.markdown import read_markdown_file, process_inline_content
 from telar.core import find_csv_with_fallback
+
+# Fields already handled explicitly in generate_objects() frontmatter.
+# Any key NOT in this set is treated as a custom field and written to extra_metadata.
+KNOWN_OBJECT_FIELDS = {
+    'object_id', 'title', 'creator', 'period', 'medium', 'dimensions',
+    'location', 'credit', 'thumbnail', 'iiif_manifest', 'source_url',
+    'source', 'object_warning', 'object_warning_short', 'year',
+    'object_type', 'subjects', 'is_featured_sample', '_demo',
+    'description', 'featured',
+}
+
+
+def _yaml_escape(value):
+    """Escape a string value for safe inclusion in double-quoted YAML."""
+    s = str(value)
+    s = s.replace('\\', '\\\\')
+    s = s.replace('"', '\\"')
+    return s
+
 
 def generate_objects():
     """Generate object markdown files from objects.json"""
@@ -100,6 +119,22 @@ object_warning_short: "{obj.get('object_warning_short', '')}"
 
         if is_demo:
             content += "demo: true\n"
+
+        # Collect custom fields not in the known set
+        extra = {}
+        for key, value in obj.items():
+            if key in KNOWN_OBJECT_FIELDS:
+                continue
+            if value is None or (isinstance(value, float) and str(value) == 'nan'):
+                continue
+            s = str(value).strip()
+            if s and s.lower() != 'nan':
+                extra[key] = s
+
+        if extra:
+            content += "extra_metadata:\n"
+            for key, value in extra.items():
+                content += f'  {key}: "{_yaml_escape(value)}"\n'
 
         content += f"""layout: object
 ---
