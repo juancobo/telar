@@ -28,27 +28,65 @@ correct URL prefix so the manifest points to the right location. For
 local development, use the localhost URL; for production, use the
 site's public URL.
 
-Version: v0.7.0-beta
+Tile generation backends:
+  - libvips (preferred): 28x faster. Uses `vips dzsave --layout iiif3`.
+    Install: brew install vips (macOS) / apt-get install libvips-dev (Linux)
+  - iiif library (fallback): Pure Python, no system dependencies.
+    Install: pip install iiif
+
+Version: v0.8.2-beta
 """
 
 import os
 import sys
 import json
+import re
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
-def check_dependencies():
-    """Check if required dependencies are installed"""
+
+# ---------------------------------------------------------------------------
+# Backend detection
+# ---------------------------------------------------------------------------
+
+def _detect_tile_backend():
+    """Detect available IIIF tile generation backend.
+
+    Prefers libvips (28x faster) over the Python iiif library.
+    Returns 'libvips', 'iiif', or None.
+    """
+    if shutil.which('vips'):
+        return 'libvips'
     try:
         from iiif.static import IIIFStatic
+        return 'iiif'
+    except ImportError:
+        return None
+
+
+def check_dependencies():
+    """Check if required dependencies are installed.
+
+    Returns:
+        Backend name ('libvips' or 'iiif') if ready, None if not.
+    """
+    try:
         from PIL import Image, ImageOps
-    except ImportError as e:
-        print("❌ Missing required dependencies!")
-        print("\nPlease install:")
-        print("  pip install iiif Pillow")
-        print("\nOr use the provided requirements file:")
-        print("  pip install -r requirements.txt")
-        return False
+    except ImportError:
+        print("❌ Missing required dependency: Pillow")
+        print("   pip install Pillow")
+        return None
+
+    backend = _detect_tile_backend()
+    if backend is None:
+        print("❌ No IIIF tile generation backend found!")
+        print("\nInstall one of:")
+        print("  libvips (recommended): brew install vips  (macOS)")
+        print("                         sudo apt-get install libvips-dev  (Linux)")
+        print("  Python iiif library:   pip install iiif")
+        return None
 
     # Check for optional HEIC support
     try:
@@ -58,65 +96,45 @@ def check_dependencies():
         print("   To enable HEIC support: pip install pillow-heif")
         print()
 
-    return True
+    return backend
 
-def get_base_url_from_config():
-    """
-    Read url and baseurl from _config.yml and combine them.
 
-    Returns:
-        Combined URL (e.g., "https://example.com/baseurl") or None if config can't be read
-    """
-    try:
-        import yaml
-        with open('_config.yml', 'r') as f:
-            config = yaml.safe_load(f)
+# ---------------------------------------------------------------------------
+# Image preprocessing (shared by both backends)
+# ---------------------------------------------------------------------------
 
-        url = config.get('url', '')
-        baseurl = config.get('baseurl', '')
+def preprocess_image(image_path):
+    """Preprocess an image for IIIF tile generation.
 
-        if url:
-            return url + baseurl
-        return None
-    except Exception as e:
-        # Silently fail - caller will use fallback
-        return None
-
-def generate_iiif_for_image(image_path, output_dir, object_id, base_url):
-    """
-    Generate IIIF tiles for a single image
+    Handles EXIF orientation, transparency removal, palette mode conversion,
+    and format conversion to JPEG. Both backends need a clean JPEG input.
 
     Args:
         image_path: Path to source image
-        output_dir: Output directory for tiles (parent of object_id directory)
-        object_id: Identifier for this object
-        base_url: Base URL for the site
-    """
-    from iiif.static import IIIFStatic
-    from PIL import Image, ImageOps
-    import tempfile
 
-    # Register HEIF plugin for HEIC/HEIF support if available
+    Returns:
+        (processed_path, temp_file_path_or_None)
+        If a temp file was created, caller must delete it after use.
+    """
+    from PIL import Image, ImageOps
+
+    # Register HEIF plugin if available
     try:
         from pillow_heif import register_heif_opener
         register_heif_opener()
     except ImportError:
-        pass  # HEIC support unavailable
+        pass
 
-    # Preprocess PNG images with transparency (RGBA) to RGB
-    # because IIIF library saves as JPEG which doesn't support alpha
-    processed_image_path = image_path
-    temp_file = None
+    processed_path = image_path
+    temp_path = None
 
     try:
         img = Image.open(image_path)
 
-        # Apply EXIF orientation if present (thanks to Tara for reporting)
-        # This ensures portrait photos from phones/cameras display correctly
+        # Apply EXIF orientation if present
         img_before_exif = img
         img = ImageOps.exif_transpose(img)
         if img is None:
-            # No EXIF orientation data, use original
             img = img_before_exif
         elif img != img_before_exif:
             print(f"  ↻ Applied EXIF orientation correction")
@@ -125,7 +143,7 @@ def generate_iiif_for_image(image_path, output_dir, object_id, base_url):
         exif = img_before_exif.getexif()
         has_exif_orientation = exif and 274 in exif and exif[274] != 1
 
-        # Convert image to RGB if needed and create JPEG for IIIF processing
+        # Convert image to RGB if needed
         needs_conversion = False
         converted_img = img
 
@@ -133,7 +151,7 @@ def generate_iiif_for_image(image_path, output_dir, object_id, base_url):
         if img.mode in ['RGBA', 'LA']:
             print(f"  ⚠️  Converting {img.mode} to RGB (removing transparency)")
             rgb_img = Image.new('RGB', img.size, (255, 255, 255))
-            rgb_img.paste(img, mask=img.split()[-1])  # Use alpha channel as mask
+            rgb_img.paste(img, mask=img.split()[-1])
             converted_img = rgb_img
             needs_conversion = True
 
@@ -166,39 +184,169 @@ def generate_iiif_for_image(image_path, output_dir, object_id, base_url):
                 print(f"  ⚠️  Converting PNG to JPEG for IIIF processing")
 
             # Save to temporary JPEG file
-            temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
-            converted_img.save(temp_file.name, 'JPEG', quality=95)
-            processed_image_path = Path(temp_file.name)
-            temp_file.close()
+            tf = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+            converted_img.save(tf.name, 'JPEG', quality=95)
+            processed_path = Path(tf.name)
+            temp_path = tf.name
+            tf.close()
     except Exception as e:
         print(f"  ⚠️  Error preprocessing image: {e}")
-        # Continue with original image
 
-    # Note: iiif library creates a subdirectory with the identifier name
-    # We pass the parent directory, and it creates parent_dir/object_id/
+    return processed_path, temp_path
+
+
+# ---------------------------------------------------------------------------
+# libvips backend
+# ---------------------------------------------------------------------------
+
+def _generate_tiles_libvips(processed_path, tiles_dir, object_id, base_url):
+    """Generate IIIF tiles using libvips (vips dzsave).
+
+    Args:
+        processed_path: Path to preprocessed JPEG
+        tiles_dir: Output directory for this object's tiles
+        object_id: Object identifier
+        base_url: Base URL for the site
+    """
+    parent_dir = tiles_dir.parent
+
+    # vips dzsave creates output at the specified path
+    cmd = [
+        'vips', 'dzsave',
+        str(processed_path),
+        str(parent_dir / object_id),
+        '--layout', 'iiif3',
+        '--tile-size', '512',
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"vips dzsave failed: {result.stderr}")
+
+    # Clean up vips-properties.xml (created alongside the output directory)
+    vips_props = parent_dir / 'vips-properties.xml'
+    if vips_props.exists():
+        vips_props.unlink()
+
+    # Post-process: patch info.json and generate full/max image
+    _patch_info_json(tiles_dir, object_id, base_url)
+    _generate_full_max(processed_path, tiles_dir)
+
+
+def _patch_info_json(tiles_dir, object_id, base_url):
+    """Patch libvips-generated info.json with correct id and sizes.
+
+    libvips writes a placeholder id and omits the sizes array.
+    We fix the id to the production URL and populate sizes by
+    scanning the full/ directory for available thumbnail files.
+    """
+    info_path = tiles_dir / 'info.json'
+    if not info_path.exists():
+        return
+
+    with open(info_path, 'r') as f:
+        info = json.load(f)
+
+    # Set correct id URL
+    info['id'] = f"{base_url}/iiif/objects/{object_id}"
+
+    # Populate sizes array from full/ directory
+    full_dir = tiles_dir / 'full'
+    sizes = []
+    if full_dir.exists():
+        for entry in full_dir.iterdir():
+            if not entry.is_dir() or entry.name == 'max':
+                continue
+            # Parse directory name: "w,h"
+            match = re.match(r'^(\d+),(\d+)$', entry.name)
+            if match:
+                sizes.append({
+                    'width': int(match.group(1)),
+                    'height': int(match.group(2)),
+                })
+
+    if sizes:
+        sizes.sort(key=lambda s: s['width'])
+        info['sizes'] = sizes
+
+    # Add extraFormats and extraQualities for spec compliance
+    info['extraFormats'] = ['jpg']
+    info['extraQualities'] = ['default']
+
+    with open(info_path, 'w') as f:
+        json.dump(info, f, indent=2)
+
+
+def _generate_full_max(processed_path, tiles_dir):
+    """Generate the full/max/0/default.jpg image.
+
+    IIIF 3.0 viewers request the full-size image at this canonical path.
+    libvips doesn't generate it, so we create it from the preprocessed source.
+    """
+    from PIL import Image
+
+    max_dir = tiles_dir / 'full' / 'max' / '0'
+    max_dir.mkdir(parents=True, exist_ok=True)
+    dest = max_dir / 'default.jpg'
+
+    img = Image.open(processed_path)
+    if img.mode not in ('RGB', 'L'):
+        img = img.convert('RGB')
+    img.save(dest, 'JPEG', quality=95)
+
+
+# ---------------------------------------------------------------------------
+# iiif library backend (fallback)
+# ---------------------------------------------------------------------------
+
+def _generate_tiles_iiif(processed_path, tiles_dir, object_id, base_url):
+    """Generate IIIF tiles using the Python iiif library."""
+    from iiif.static import IIIFStatic
+
+    parent_dir = tiles_dir.parent
+
+    sg = IIIFStatic(
+        dst=str(parent_dir),
+        prefix=f"{base_url}/iiif/objects",
+        tilesize=512,
+        api_version='3.0'
+    )
+    sg.generate(src=str(processed_path), identifier=object_id)
+
+
+# ---------------------------------------------------------------------------
+# Shared post-generation
+# ---------------------------------------------------------------------------
+
+def generate_iiif_for_image(image_path, output_dir, object_id, base_url, backend):
+    """
+    Generate IIIF tiles for a single image
+
+    Args:
+        image_path: Path to source image
+        output_dir: Output directory for tiles (parent of object_id directory)
+        object_id: Identifier for this object
+        base_url: Base URL for the site
+        backend: 'libvips' or 'iiif'
+    """
     parent_dir = output_dir.parent
     tiles_dir = parent_dir / object_id
 
-    try:
-        # Create static generator
-        # Note: iiif library appends the identifier to the prefix, so we use objects/ not objects/object_id/
-        sg = IIIFStatic(
-            dst=str(parent_dir),
-            prefix=f"{base_url}/iiif/objects",  # iiif library will append /{identifier}
-            tilesize=512,
-            api_version='3.0'
-        )
+    # Preprocess image (shared by both backends)
+    processed_path, temp_path = preprocess_image(image_path)
 
-        # Generate tiles (this creates parent_dir/object_id/)
-        sg.generate(src=str(processed_image_path), identifier=object_id)
+    try:
+        if backend == 'libvips':
+            _generate_tiles_libvips(processed_path, tiles_dir, object_id, base_url)
+        else:
+            _generate_tiles_iiif(processed_path, tiles_dir, object_id, base_url)
 
         # Copy full-resolution image for UniversalViewer BEFORE cleaning up temp file
         # UniversalViewer expects a base image at the path declared in the manifest
-        copy_base_image(processed_image_path, tiles_dir, object_id)
+        copy_base_image(processed_path, tiles_dir, object_id)
     finally:
         # Clean up temporary file if created
-        if temp_file and Path(temp_file.name).exists():
-            Path(temp_file.name).unlink()
+        if temp_path and Path(temp_path).exists():
+            Path(temp_path).unlink()
 
     # Create manifest wrapper for UniversalViewer
     create_manifest(tiles_dir, object_id, image_path, base_url)
@@ -422,6 +570,28 @@ def find_image_for_object(object_id, source_dir):
 
     return None
 
+def get_base_url_from_config():
+    """
+    Read url and baseurl from _config.yml and combine them.
+
+    Returns:
+        Combined URL (e.g., "https://example.com/baseurl") or None if config can't be read
+    """
+    try:
+        import yaml
+        with open('_config.yml', 'r') as f:
+            config = yaml.safe_load(f)
+
+        url = config.get('url', '')
+        baseurl = config.get('baseurl', '')
+
+        if url:
+            return url + baseurl
+        return None
+    except Exception as e:
+        # Silently fail - caller will use fallback
+        return None
+
 def generate_iiif_tiles(source_dir='components/images', output_dir='iiif/objects', base_url=None):
     """
     Generate IIIF tiles for objects listed in objects.json
@@ -431,7 +601,8 @@ def generate_iiif_tiles(source_dir='components/images', output_dir='iiif/objects
         output_dir: Directory to output IIIF tiles and manifests (default: iiif/objects)
         base_url: Base URL for the site
     """
-    if not check_dependencies():
+    backend = check_dependencies()
+    if not backend:
         return False
 
     source_path = Path(source_dir)
@@ -458,6 +629,7 @@ def generate_iiif_tiles(source_dir='components/images', output_dir='iiif/objects
     print(f"Source: {source_dir}")
     print(f"Output: {output_dir}")
     print(f"Base URL: {base_url}")
+    print(f"Backend: {backend}" + (" (28x faster)" if backend == 'libvips' else " (fallback)"))
 
     # Show helpful message for local development
     if base_url and ('github.io' in base_url or base_url.startswith('https://')):
@@ -515,7 +687,7 @@ def generate_iiif_tiles(source_dir='components/images', output_dir='iiif/objects
             object_output.mkdir(parents=True, exist_ok=True)
 
             # Generate IIIF tiles and manifest
-            generate_iiif_for_image(image_file, object_output, object_id, base_url)
+            generate_iiif_for_image(image_file, object_output, object_id, base_url, backend)
 
             print(f"  ✓ Generated tiles for {object_id}")
             processed_count += 1
