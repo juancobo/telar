@@ -33,20 +33,18 @@ story_key: "test"
 
 # Google Sheets Integration (optional)
 # Manage content via Google Sheets instead of editing CSV files directly.
-# See https://telar.org/docs/workflows/google-sheets/ for detailed setup instructions.
+# See https://telar.org/docs/your-data/google-sheets/ for detailed setup instructions.
 #
 # Setup:
 # 1. Get the template: Duplicate our template at https://bit.ly/telar-template
-# 2. Share your sheet: Anyone with the link (Viewer access)
-# 3. Publish your sheet: File > Share > Publish to web
-# 4. Paste both URLs below
-# 5. Set enabled: true
-# 6. Commit changes
+# 2. Publish your sheet: File > Share > Publish to web
+# 3. Paste the published URL below
+# 4. Set enabled: true
+# 5. Commit changes
 #    - If using GitHub Pages: GitHub Actions will automatically discover tab GIDs and fetch CSVs
 #    - If running locally: Run `python3 scripts/fetch_google_sheets.py` before building
 google_sheets:
   enabled: true
-  shared_url: "https://docs.google.com/spreadsheets/d/1k9h2t9PeqH9zyaS6Z1mrnkaGABkl2TS8EhPLZnvkbkk/edit?usp=sharing"
   published_url: "https://docs.google.com/spreadsheets/d/e/2PACX-1vSpWIrYEfvRkaWVDu9_ab02jn7BaoKSmg6hG3aeojp7orDhEetv5TcQOHZ6czeF77uAUlg9XrVM9gMD/pubhtml"
 
 
