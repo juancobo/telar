@@ -29,7 +29,7 @@ name: Build and Deploy Telar Site
 # images or objects.csv), it restores tiles from the GitHub Actions cache
 # instead of regenerating them, which saves significant build time.
 #
-# Version: v0.8.0-beta
+# Version: v0.8.2-beta
 
 on:
   push:
@@ -64,6 +64,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Install libvips (for fast IIIF tile generation)
+        run: sudo apt-get install -y libvips-tools
 
       - name: Install Python dependencies
         run: |
